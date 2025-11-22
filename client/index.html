@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
         body {
             font-family: 'Inter', sans-serif;
             background-color: #f7f7f7;
@@ -48,6 +48,76 @@
         .btn-success {
             @apply bg-green-600 text-white hover:bg-green-700;
         }
+        
+        /* --- NEW CUSTOM STYLES FOR OVERLAPPING HAND (Scaled for responsiveness) --- */
+        
+        /* Container for the absolute cards */
+        .fan-container {
+            position: relative;
+            /* Max width calculation is dynamic in JS, this ensures base properties */
+            width: 100%; 
+            min-height: 140px; /* Tall enough for the card height + lift */
+            padding-top: 20px; 
+            margin: 0 auto;
+        }
+
+        .card-element {
+            position: absolute;
+            width: 80px; /* Scaled down from 150px */
+            height: 120px; /* Scaled down from 200px */
+            background-color: white;
+            border: 2px solid #000;
+            border-radius: 6px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            
+            /* CHANGE 1: Display card rank at the top left */
+            display: flex;
+            align-items: flex-start; /* Align content to the top */
+            justify-content: flex-start; /* Align content to the left */
+            padding: 5px; 
+            
+            font-size: 24px; /* Adjusted size for corner display */
+            font-weight: 900;
+            cursor: pointer;
+            transition: transform 0.2s ease-out, border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .red-card {
+            color: red;
+            border-color: red;
+        }
+        
+        .joker-text {
+            /* Ensures Joker text remains centered by overriding card-element flex rules */
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center; /* Center vertically */
+            justify-content: center; /* Center horizontally */
+
+            font-size: 14px; /* Scaled font for joker */
+            line-height: 1.2;
+            text-align: center;
+            padding: 5px;
+        }
+
+        /* --- New Selected State --- */
+        .card-element.card-selected {
+            /* CHANGE 2: Translates up on the Y-axis */
+            transform: translateY(-20px); 
+            border-color: #10B981; 
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.5);
+            /* REMOVED: z-index: 100 !important; to maintain stacking order */
+        }
+
+        /* Override the original .hand-display to accommodate absolute positioning */
+        .hand-display {
+            @apply p-4 bg-gray-100 rounded-lg border-t border-gray-200 overflow-x-auto;
+            min-height: 140px; 
+            display: flex; /* keep flex for centering fan-container */
+            justify-content: center;
+            align-items: flex-end; /* cards stick to bottom */
+        }
     </style>
 </head>
 <body>
@@ -56,13 +126,13 @@
         
         <!-- Connection Status & ID -->
         <div class="bg-yellow-100 p-3 rounded-lg border border-yellow-300">
-            <p class="font-semibold">Your ID: <span id="client-id" class="font-mono text-sm">Connecting...</span></p>
-            <p class="font-semibold">Your Current Hand: <span id="current-hand" class="font-mono text-sm break-words">None (Join a room)</span></p>
+            <p class="font-semibold">Your Player ID: <span id="client-id" class="font-mono text-sm break-words">Connecting...</span></p>
+            <p class="font-semibold">Selected Hand: <span id="selected-hand-display" class="font-mono text-sm text-green-700 break-words">None</span></p>
         </div>
 
         <!-- Room Controls -->
         <div class="flex flex-wrap items-center gap-2 p-4 bg-white rounded-lg shadow-lg">
-            <input type="text" id="room" placeholder="Room Name" class="p-2 border border-gray-300 rounded-lg flex-grow min-w-[150px]">
+            <input type="text" id="room" placeholder="Room Name (3 players needed)" class="p-2 border border-gray-300 rounded-lg flex-grow min-w-[150px]">
             <button id="join" class="btn btn-primary">Join Room</button>
             <button id="leave" class="btn btn-danger" style="display: none;">Leave Room</button>
             <button id="status" class="btn btn-secondary" style="display: none;">Ready</button>
@@ -74,15 +144,21 @@
             <button id="pass-call" class="btn btn-secondary">Pass Call</button>
         </div>
 
+        <!-- Hand Display Area -->
+        <div id="hand-container" class="hand-display">
+            <p class="text-gray-500">Your hand will appear here when the game starts.</p>
+        </div>
+
         <!-- Game Interaction -->
         <div class="p-4 bg-white rounded-lg shadow-lg">
             <h2 class="text-xl font-bold mb-2">Game Actions & Chat</h2>
             <div class="flex gap-2 mb-3">
-                <input type="text" id="input" placeholder="Enter cards (e.g., 3, 3, 3, 4, 5) or chat message" class="p-2 border border-gray-300 rounded-lg flex-grow" disabled>
+                <input type="text" id="input" placeholder="Enter chat message" class="p-2 border border-gray-300 rounded-lg flex-grow">
                 <button id="send" class="btn btn-primary min-w-[80px]">Chat</button>
             </div>
             <div class="flex justify-start gap-3">
-                <button id="play" class="btn btn-success" disabled>Play Hand</button>
+                <button id="clear-selection" class="btn btn-secondary" disabled>Clear Selection</button>
+                <button id="play" class="btn btn-success" disabled>Play Selected Hand</button>
                 <button id="pass" class="btn btn-secondary" disabled>Pass</button>
             </div>
         </div>
@@ -95,8 +171,381 @@
 
     </div>
 
-    <script src="./script.js">
+    <script type="text/javascript">
+        // NOTE: If deploying to Render, you must replace 'http://localhost:6969' 
+        // with your deployed URL (e.g., '').
+        const LOCAL_URL = 'https://doudizhu-eo39.onrender.com';
+        
+        let room = '';
+        let status = false; // ready status
+        let name; // Stores the ephemeral socket.id
+        let socket;
+        
+        // --- Card State Management ---
+        // currentHand stores the *exact* list of cards the player owns
+        let currentHand = []; 
+        // selectedCards stores the card names (e.g., ["3", "3", "A"]) currently chosen for playing
+        let selectedCards = []; 
 
+        // Map for sorting and display
+        const cardValueMap = { "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10, "J": 11, "Q": 12, "K": 13, "A": 14, "2": 15, "Black Joker": 16, "Red Joker": 17 };
+        // Cards that should display as red text (based on standard Doudizhu/deck colors)
+        const redCards = ["10", "J", "Q", "K", "A", "2", "Red Joker"]; 
+
+        // Card Dimensions for overlapping UI (Scaled)
+        const CARD_WIDTH = 80; // px
+        const SPACING = 24;   // px (30% of 80px visibility)
+
+
+        // Helper to update the log display
+        function display(message) {
+            const displayElement = document.getElementById('display');
+            displayElement.innerHTML += (message + "\n");
+            displayElement.scrollTop = displayElement.scrollHeight;
+        }
+
+        // --- Card Rendering Logic ---
+
+        /**
+         * Renders the player's current hand as individually clickable elements
+         * using the new absolute, overlapping UI.
+         */
+        function renderHand() {
+            const handContainer = document.getElementById('hand-container');
+            handContainer.innerHTML = ''; // Clear existing content
+
+            if (currentHand.length === 0) {
+                handContainer.innerHTML = '<p class="text-gray-500">Your hand will appear here when the game starts.</p>';
+                return;
+            }
+            
+            // Create the fan container (relative parent for absolute cards)
+            const fanContainer = document.createElement('div');
+            fanContainer.className = 'fan-container';
+            
+            // Calculate the total required width for the fan
+            const numCards = currentHand.length;
+            const fanWidth = (numCards - 1) * SPACING + CARD_WIDTH;
+            fanContainer.style.width = `${fanWidth}px`;
+
+
+            // Use a separate array to track which cards in the currentHand are selected
+            const tempSelected = [...selectedCards]; 
+
+            // Sort the hand before rendering to maintain consistent positioning
+            const sortedHand = currentHand.slice().sort((a, b) => {
+                return cardValueMap[a] - cardValueMap[b];
+            });
+
+            sortedHand.forEach((cardName, index) => {
+                const cardDiv = document.createElement('div');
+                cardDiv.className = 'card-element';
+                
+                // 1. Dynamic Positioning
+                cardDiv.style.left = `${index * SPACING}px`;
+                cardDiv.style.zIndex = index + 1; // Rightmost card (highest index) is on top
+                
+                // 2. Content & Color
+                const rankOnly = cardName.replace(/[♠♥♣♦]/, '');
+                let contentHTML;
+                
+                if (cardName.includes("Joker")) {
+                    // Special Joker Content
+                    const isRed = cardName.includes("Red");
+                    cardDiv.classList.add(isRed ? 'red-card' : 'text-black');
+                    const text = cardName.toUpperCase().replace('JOKER', '<br/>JOKER');
+                    // The joker-text span is needed to re-center this content within the card
+                    contentHTML = `<span class="joker-text">${text}</span>`;
+                    
+                } else {
+                    // Standard Card Content (Rank only, now displayed top-left via CSS)
+                    const isRed = redCards.includes(rankOnly);
+                    cardDiv.classList.add(isRed ? 'red-card' : 'text-black');
+                    contentHTML = rankOnly;
+                }
+
+                cardDiv.innerHTML = contentHTML;
+                cardDiv.dataset.cardName = cardName;
+                
+                // 3. Selection State
+                // Find the first instance of this cardName in tempSelected and remove it to mark it as 'used'
+                const selectionIndex = tempSelected.indexOf(cardName);
+                if (selectionIndex > -1) {
+                    cardDiv.classList.add('card-selected');
+                    tempSelected.splice(selectionIndex, 1);
+                }
+                
+                // 4. Event Listener
+                cardDiv.addEventListener('click', toggleCardSelection);
+                
+                fanContainer.appendChild(cardDiv);
+            });
+            
+            handContainer.appendChild(fanContainer);
+            updateSelectedDisplay();
+        }
+        
+        /**
+         * Toggles the selection status of a card when clicked.
+         * The function clears and re-renders the hand to correctly handle 
+         * multiple duplicates of the same card (e.g., three 7s).
+         */
+        function toggleCardSelection(event) {
+            const cardDiv = event.currentTarget;
+            const cardName = cardDiv.dataset.cardName;
+
+            // Update the selectedCards array based on the current click
+            if (cardDiv.classList.contains('card-selected')) {
+                // Deselect: remove from the selectedCards array
+                const indexToRemove = selectedCards.indexOf(cardName);
+                if (indexToRemove > -1) {
+                    selectedCards.splice(indexToRemove, 1);
+                }
+            } else {
+                // Select: add to the selectedCards array
+                selectedCards.push(cardName);
+            }
+            
+            // Re-render the hand to ensure the visual state of all cards matches the selectedCards array
+            renderHand(); 
+            updateActionButtons();
+        }
+
+        /**
+         * Updates the visual display of selected cards, sorted by value.
+         */
+        function updateSelectedDisplay() {
+            const displayElement = document.getElementById('selected-hand-display');
+            
+            // Sort the selected cards for display
+            const sortedSelection = selectedCards.slice().sort((a, b) => {
+                return cardValueMap[a] - cardValueMap[b];
+            });
+            
+            if (sortedSelection.length > 0) {
+                displayElement.textContent = sortedSelection.join(', ');
+            } else {
+                displayElement.textContent = "None";
+            }
+        }
+        
+        /**
+         * Enables/disables play and clear buttons based on selection and turn status.
+         */
+        function updateActionButtons() {
+            const playButton = document.getElementById('play');
+            const clearButton = document.getElementById('clear-selection');
+            const passButton = document.getElementById('pass');
+            
+            // The turn is active if the pass button is NOT disabled
+            const isMyTurn = !passButton.disabled;
+            
+            // Play button is enabled if it's the turn AND cards are selected
+            playButton.disabled = selectedCards.length === 0 || !isMyTurn;
+            
+            // Clear button is enabled if cards are selected
+            clearButton.disabled = selectedCards.length === 0;
+        }
+
+        /**
+         * Resets the selection state and re-renders to clear visual selection.
+         */
+        function clearSelection() {
+            selectedCards = [];
+            // Re-render the hand to ensure all 'card-selected' classes are cleared properly
+            renderHand(); 
+            updateActionButtons();
+        }
+
+        // --- Socket Initialization ---
+        socket = io(LOCAL_URL); 
+
+        // --- Socket Listeners ---
+        socket.on('connect', () => {
+            name = String(socket.id);
+            document.getElementById('client-id').textContent = name;
+            display(`Connected. Your Player ID: ${name}`);
+        });
+
+        socket.on("receive-message", display);
+        socket.on("receive-room", display);
+        socket.on("receive-room-status", display);
+        socket.on("receive-status", display);
+        socket.on("receive-leave", display);
+        
+        // Receive and render the player's hand
+        socket.on("receive-cards", hand => {
+            currentHand = hand; 
+            selectedCards = []; 
+            renderHand(); 
+        });
+
+        // Turn management
+        socket.on("turn-update", (activePlayerId) => {
+            const isMyTurn = name === activePlayerId;
+            
+            const controls = document.getElementById('call-controls');
+            const playButton = document.getElementById('play');
+            const passButton = document.getElementById('pass');
+            
+            // Set base turn state for playing buttons
+            passButton.disabled = !isMyTurn;
+            document.getElementById('input').disabled = false; // Chat always active
+
+            if (controls.style.display === 'flex') {
+                // Landlord Calling Phase
+                document.getElementById('call-landlord').disabled = !isMyTurn;
+                document.getElementById('pass-call').disabled = !isMyTurn;
+                
+                // Disable playing controls entirely during calling
+                playButton.disabled = true;
+                document.getElementById('clear-selection').disabled = true;
+            } else {
+                // Playing Phase
+                // Play and Clear buttons depend on selection AND turn
+                updateActionButtons(); 
+            }
+            
+            if (isMyTurn) {
+                display("\n➡️ It's your turn! Select cards to play or Pass.");
+            } else {
+                display(`\n⏳ Waiting for ${activePlayerId}...`);
+            }
+        });
+
+        socket.on("receive-room-status", (message) => {
+            display(message);
+            if (message.includes("Starting Landlord calling phase")) {
+                // UI state transitions for calling
+                document.getElementById('join').style.display = 'none';
+                document.getElementById('room').style.display = 'none';
+                document.getElementById('leave').style.display = 'none';
+                document.getElementById('status').style.display = 'none';
+                document.getElementById('call-controls').style.display = 'flex';
+                
+            } else if (message.includes("Game has started. Playing phase active.")) {
+                // UI state transitions for playing
+                document.getElementById('call-controls').style.display = 'none';
+            }
+        });
+        
+        // --- RESET LISTENER ---
+        socket.on("game-over-reset", () => {
+            display("\n--- Game Over. You are now NOT READY. Press 'Ready' to start the next game. ---");
+            
+            // 1. Reset client-side state
+            status = false; 
+            currentHand = [];
+            selectedCards = [];
+            
+            // 2. Reset UI elements
+            document.getElementById('hand-container').innerHTML = '<p class="text-gray-500">Your hand will appear here when the game starts.</p>';
+            document.getElementById('selected-hand-display').textContent = "None";
+            
+            // 3. Hide game-specific controls
+            document.getElementById('call-controls').style.display = 'none';
+            document.getElementById('play').disabled = true;
+            document.getElementById('pass').disabled = true;
+            document.getElementById('clear-selection').disabled = true;
+            
+            // 4. Show ready/leave controls again
+            document.getElementById('status').style.display = 'inline-block';
+            document.getElementById('status').innerHTML = "Ready"; 
+            document.getElementById('leave').style.display = 'inline-block';
+        });
+        
+        // --- Button Event Listeners ---
+
+        // Join Room
+        document.getElementById('join').addEventListener('click', () => {
+            room = document.getElementById('room').value.trim();
+            if (room && name) { 
+                socket.emit("join-room", room, name); 
+                document.getElementById('leave').style.display = 'inline-block';
+                document.getElementById('status').style.display = 'inline-block';
+                document.getElementById('join').style.display = 'none';
+                document.getElementById('room').style.display = 'none';
+            } else {
+                display("Please enter a room name and ensure you are connected.");
+            }
+        });
+
+        // Leave Room
+        document.getElementById('leave').addEventListener('click', () => {
+            if (room && name) socket.emit("leave-room", room, name);
+            room = '';
+            status = false;
+            currentHand = [];
+            selectedCards = [];
+            document.getElementById('leave').style.display = 'none';
+            document.getElementById('status').style.display = 'none';
+            document.getElementById('join').style.display = 'inline-block';
+            document.getElementById('room').style.display = 'inline-block';
+            document.getElementById('call-controls').style.display = 'none';
+            document.getElementById('status').innerHTML = "Ready";
+            document.getElementById('hand-container').innerHTML = '<p class="text-gray-500">Your hand will appear here when the game starts.</p>';
+            document.getElementById('selected-hand-display').textContent = "None";
+            display(`You have left the room.`);
+        });
+
+        // Toggle Ready Status
+        document.getElementById('status').addEventListener('click', () => {
+            status = !status;
+            document.getElementById('status').innerHTML = status ? "Not Ready" : "Ready";
+            socket.emit("send-status", room, name, status); 
+            display(`You are ${status ? 'ready' : 'not ready'}.`);
+        });
+
+        // Send Chat Message
+        document.getElementById('send').addEventListener('click', () => {
+            const message = document.getElementById('input').value.trim();
+            if (message && name) {
+                document.getElementById('input').value = ''; 
+                socket.emit("send-message", message, name, room);
+            }
+        });
+        
+        // --- Landlord Calling Actions ---
+        document.getElementById('call-landlord').addEventListener('click', () => {
+            if (name) socket.emit("call-landlord", room, name, 'call');
+            document.getElementById('call-landlord').disabled = true;
+            document.getElementById('pass-call').disabled = true;
+        });
+
+        document.getElementById('pass-call').addEventListener('click', () => {
+            if (name) socket.emit("call-landlord", room, name, 'pass');
+            document.getElementById('call-landlord').disabled = true;
+            document.getElementById('pass-call').disabled = true;
+        });
+        
+        // --- Playing Actions ---
+        
+        // Clear Selection Button
+        document.getElementById('clear-selection').addEventListener('click', clearSelection);
+
+        // Play Hand (Uses selectedCards state)
+        document.getElementById('play').addEventListener('click', () => {
+            if (selectedCards.length > 0 && name) {
+                // Send a copy of the selected cards
+                const handToPlay = [...selectedCards]; 
+                
+                socket.emit("play-hand", room, name, handToPlay);
+                
+                // Note: clearSelection() is called in the socket.on("play-hand") 
+                // confirmation loop on the server, but we call it locally for better feel.
+                clearSelection(); 
+            } else {
+                 display("Please select cards to play.");
+            }
+        });
+
+        // Pass Hand
+        document.getElementById('pass').addEventListener('click', () => {
+            if (name) {
+                clearSelection(); // Clear any selected cards before passing
+                socket.emit("pass-hand", room, name); 
+            }
+        });
 
     </script>
 </body>
