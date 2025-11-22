@@ -13,7 +13,7 @@
 
         // --- Socket Initialization ---
         // Note: Replace 'http://localhost:6969' with your actual server address if deployed
-        socket = io('http://localhost:6969'); 
+        socket = io('https://doudizhu-eo39.onrender.com:6969'); 
 
         // --- Socket Listeners ---
         socket.on('connect', () => {
