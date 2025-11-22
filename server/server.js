@@ -1,6 +1,21 @@
-const io = require('socket.io')(6969, {
+const http = require('http'); // Import HTTP module
+// The port is set by the hosting environment (like Render), 
+// or defaults to 6969 for local development.
+const PORT = process.env.PORT || 6969; 
+
+// Create an HTTP server first
+const server = http.createServer((req, res) => {
+    // This is a minimal HTTP handler for the Render health check
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Doudizhu Socket Server is Running');
+});
+
+// Attach Socket.IO to the HTTP server
+const io = require('socket.io')(server, {
   cors: { origin: "*" }
 });
+// REQUIRED FOR PINGING EXTERNAL URLS
+const https = require('https');
 
 // --- Card values ---
 const valueMap = {
@@ -48,9 +63,16 @@ function dealCards() {
   return [p1, p2, p3, pile];
 }
 
-// --- Room & game state ---
-let roomList = {}; // { roomName: { playerId: readyState } } (playerId is socket.id)
-let gameState = {}; // { roomName: { phase: string, hands: {playerId: []}, lastHand, turnOrder: [], turnIndex: 0, activePlayer, passCount: 0, landlordId: null, bottomPile: [], callIndex: 0 } }
+// --- Global state management using Persistent User IDs (userId) ---
+// roomList: { roomName: { userId: readyState } }
+let roomList = {}; 
+// gameState: { roomName: { ... hands: {userId: []}, ... turnOrder: [userId, ...], landlordId: userId } }
+let gameState = {}; 
+
+// --- Mapping between ephemeral Socket IDs and Persistent User IDs ---
+// This is essential for addressing the correct socket when sending targeted messages
+let socketIdToUserId = {}; // { socket.id: userId }
+let userIdToSocketId = {}; // { userId: socket.id }
 
 // --- Import combo functions ---
 // These functions live in the external 'game.js' file
@@ -59,7 +81,7 @@ const { getCombo, beats } = require('./game');
 /**
  * Transitions the game to the playing phase, assigning the landlord and distributing bottom cards.
  * @param {string} room - The room name.
- * @param {string} landlordId - The socket ID of the new landlord.
+ * @param {string} landlordId - The persistent User ID of the new landlord.
  */
 function finalizeLandlord(room, landlordId) {
     const state = gameState[room];
@@ -84,74 +106,113 @@ function finalizeLandlord(room, landlordId) {
     // 2. Inform the client to change phase controls (via receive-room-status)
     io.in(room).emit("receive-room-status", "Game has started. Playing phase active.");
 
-    // Update the landlord's hand
-    io.to(landlordId).emit("receive-cards", state.hands[landlordId]);
+    // Update the landlord's hand (Target by userId)
+    const landlordSocketId = userIdToSocketId[landlordId];
+    if (landlordSocketId) {
+        io.to(landlordSocketId).emit("receive-cards", state.hands[landlordId]);
+    }
     
     // Notify all players of the turn start
     io.in(room).emit("turn-update", state.activePlayer);
 }
 
 io.on("connection", socket => {
-  console.log(socket.id);
+  console.log(`Socket connected: ${socket.id}`);
+  
+  // Clean up mappings on disconnect
+  socket.on("disconnect", () => {
+    const userId = socketIdToUserId[socket.id];
+    if (userId) {
+        delete userIdToSocketId[userId];
+        delete socketIdToUserId[socket.id];
+        // Note: We don't remove from roomList here, allowing the user to reconnect if needed.
+    }
+    console.log(`Socket disconnected: ${socket.id}`);
+  });
 
   // --- Chat ---
-  socket.on("send-message", (msg, name, room) => {
-    socket.to(room).emit("receive-message", `${name}: ${msg}`);
-    socket.emit("receive-message", `${name}: ${msg}`);
+  // The 'name' here is the persistent userId
+  socket.on("send-message", (msg, userId, room) => {
+    socket.to(room).emit("receive-message", `${userId}: ${msg}`);
+    socket.emit("receive-message", `${userId}: ${msg}`);
   });
 
   // --- Join room ---
-  socket.on("join-room", (room, name) => {
+  // Now receives the persistent userId
+  socket.on("join-room", (room, userId) => {
     socket.join(room);
+    
+    // Update mappings
+    socketIdToUserId[socket.id] = userId;
+    userIdToSocketId[userId] = socket.id;
+
     if (!roomList[room]) roomList[room] = {};
-    roomList[room][name] = false;
-    socket.to(room).emit("receive-room", `${name} joined.`);
+    // Store status using userId, keeping previous status if user reconnects
+    roomList[room][userId] = roomList[room][userId] || false; 
+    
+    socket.to(room).emit("receive-room", `${userId} joined.`);
     socket.emit("receive-room", `You joined room: ${room}`);
   });
 
   // --- Leave room ---
-  socket.on("leave-room", (room, name) => {
+  // Now uses persistent userId
+  socket.on("leave-room", (room, userId) => {
     socket.leave(room);
-    delete roomList[room][name];
-    if (gameState[room]?.hands[name]) delete gameState[room].hands[name];
-    socket.to(room).emit("receive-leave", `${name} left.`);
+    if (roomList[room]) {
+        delete roomList[room][userId];
+    }
+    if (gameState[room]?.hands[userId]) {
+        delete gameState[room].hands[userId];
+    }
+    socket.to(room).emit("receive-leave", `${userId} left.`);
   });
 
   // --- Player ready / Game Start ---
-  socket.on("send-status", async (room, name, status) => {
-    roomList[room][name] = status;
-    io.in(room).emit("receive-status", `${name} is ${status ? "ready" : "not ready"}.`);
+  // Now uses persistent userId
+  socket.on("send-status", async (room, userId, status) => {
+    if (!roomList[room] || !userIdToSocketId[userId]) {
+        return socket.emit("receive-message", "Error: Not properly joined or connected.");
+    }
+    
+    roomList[room][userId] = status;
+    io.in(room).emit("receive-status", `${userId} is ${status ? "ready" : "not ready"}.`);
 
+    // readyPlayers are persistent user IDs
     const readyPlayers = Object.entries(roomList[room]).filter(([_, v]) => v).map(([k,_]) => k);
     
     // Start Landlord Calling Phase if exactly 3 players are ready
     if (readyPlayers.length === 3) {
       io.in(room).emit("receive-room-status", "3 players ready! Starting Landlord calling phase...");
       
-      const sockets = await io.in(room).fetchSockets();
-      const playingSockets = sockets.filter(s => readyPlayers.includes(s.id));
+      // Get the current socket objects associated with the ready User IDs
+      const playingSockets = readyPlayers
+        .map(id => io.sockets.sockets.get(userIdToSocketId[id]))
+        .filter(s => s); // Filter out any players who might have disconnected right before the start
       
       const cardList = dealCards();
-      const turnOrder = playingSockets.map(s => s.id);
+      const turnOrder = readyPlayers; // turnOrder uses persistent User IDs
       
       gameState[room] = {
         phase: 'CALLING_LANDLORD',
         landlordId: null,
-        hands: {},
+        hands: {}, // Keys are userId
         lastHand: null,
         turnOrder: turnOrder,
         turnIndex: 0,
         activePlayer: turnOrder[0],
         passCount: 0,
-        bottomPile: cardList[3], // Store the 3 bottom cards
-        callStatus: {}, // { playerId: 'call' or 'pass' }
+        bottomPile: cardList[3], 
+        callStatus: {}, 
         callIndex: 0
       };
 
-      // Deal hands to the 3 playing sockets
-      playingSockets.forEach((s, i) => {
-        gameState[room].hands[s.id] = cardList[i];
-        s.emit("receive-cards", cardList[i]);
+      // Deal hands using persistent User IDs
+      readyPlayers.forEach((id, i) => {
+        gameState[room].hands[id] = cardList[i];
+        const playerSocketId = userIdToSocketId[id];
+        if (playerSocketId) {
+            io.to(playerSocketId).emit("receive-cards", cardList[i]);
+        }
       });
 
       io.in(room).emit("receive-message", `Calling starts! ${turnOrder[0]}'s turn to call.`);
@@ -160,25 +221,25 @@ io.on("connection", socket => {
   });
 
   // --- Call Landlord ---
-  socket.on("call-landlord", (room, name, action) => {
+  // Now uses persistent userId
+  socket.on("call-landlord", (room, userId, action) => {
     const state = gameState[room];
     if (!state || state.phase !== 'CALLING_LANDLORD') return socket.emit("receive-message", "Not in the calling phase.");
-    if (socket.id !== state.activePlayer) return socket.emit("receive-message", "Not your turn to call.");
+    if (userId !== state.activePlayer) return socket.emit("receive-message", "Not your turn to call.");
 
-    state.callStatus[socket.id] = action; // 'call' or 'pass'
+    state.callStatus[userId] = action; // 'call' or 'pass'
     
-    io.in(room).emit("receive-message", `${name} chose to ${action === 'call' ? 'CALL LANDLORD' : 'PASS'}.`);
+    io.in(room).emit("receive-message", `${userId} chose to ${action === 'call' ? 'CALL LANDLORD' : 'PASS'}.`);
 
     if (action === 'call') {
-      // First player to call becomes the Landlord instantly (simplified rule)
-      return finalizeLandlord(room, socket.id);
+      // Landlord is the persistent userId
+      return finalizeLandlord(room, userId);
     } 
     
     // If passed, move to next player
     state.callIndex++;
     
     if (state.callIndex >= state.turnOrder.length) {
-      // All 3 players passed - Landlord is forced (simple rule) or game resets
       // Forcing the first player (turnOrder[0]) to be the Landlord if all pass
       io.in(room).emit("receive-message", "All players passed. Forcing the first player to be the Landlord.");
       return finalizeLandlord(room, state.turnOrder[0]);
@@ -191,14 +252,15 @@ io.on("connection", socket => {
   });
 
   // --- Play hand ---
-  socket.on("play-hand", (room, name, hand) => {
+  // Now uses persistent userId
+  socket.on("play-hand", (room, userId, hand) => {
     const state = gameState[room];
     if (!state) return socket.emit("receive-message", "Game not started.");
     if (state.phase !== 'PLAYING') return socket.emit("receive-message", "Waiting for Landlord to be determined.");
-    if (socket.id !== state.activePlayer) return socket.emit("receive-message", "Not your turn.");
+    if (userId !== state.activePlayer) return socket.emit("receive-message", "Not your turn.");
 
     // Input card validation
-    const playerHand = state.hands[socket.id];
+    const playerHand = state.hands[userId];
     // Check if player has the cards
     const cardCounts = {};
     playerHand.forEach(card => cardCounts[card] = (cardCounts[card] || 0) + 1);
@@ -217,7 +279,7 @@ io.on("connection", socket => {
 
     // Check if hand beats last hand (if there is one)
     if (state.lastHand) {
-        if (state.lastHand.player === name) {
+        if (state.lastHand.player === userId) { // Check against persistent userId
             return socket.emit("receive-message", "You cannot beat your own previous hand.");
         }
         
@@ -234,10 +296,10 @@ io.on("connection", socket => {
     });
 
     // Update last hand and reset pass count
-    state.lastHand = { combo, hand: sortedHand, player: name };
+    state.lastHand = { combo, hand: sortedHand, player: userId }; // Store persistent userId
     state.passCount = 0;
 
-    const msg = `${name} played: ${sortedHand.join(", ")}. Remaining: ${playerHand.length}`;
+    const msg = `${userId} played: ${sortedHand.join(", ")}. Remaining: ${playerHand.length}`;
     socket.emit("receive-message", msg);
     socket.to(room).emit("receive-message", msg);
     
@@ -246,14 +308,14 @@ io.on("connection", socket => {
 
     // Win check
     if (playerHand.length === 0) {
-      const role = state.landlordId === socket.id ? 'Landlord' : 'Peasant';
-      io.in(room).emit("receive-message", `${name} (${role}) wins the game!`);
+      const role = state.landlordId === userId ? 'Landlord' : 'Peasant';
+      io.in(room).emit("receive-message", `${userId} (${role}) wins the game!`);
       
       // --- GAME RESET LOGIC ---
       if (roomList[room]) {
-          // Reset readiness status for all players in the roomList
-          Object.keys(roomList[room]).forEach(playerId => {
-              roomList[room][playerId] = false;
+          // Reset readiness status for all players in the roomList (which uses userId keys)
+          Object.keys(roomList[room]).forEach(playerUserId => {
+              roomList[room][playerUserId] = false;
           });
           io.in(room).emit("receive-status", "All players reset to not ready.");
       }
@@ -270,17 +332,18 @@ io.on("connection", socket => {
 
     // Next turn
     state.turnIndex = (state.turnIndex + 1) % state.turnOrder.length;
-    state.activePlayer = state.turnOrder[state.turnIndex];
+    state.activePlayer = state.turnOrder[state.turnIndex]; // activePlayer is userId
     io.in(room).emit("turn-update", state.activePlayer);
     io.in(room).emit("receive-message", `It's ${state.activePlayer}'s turn.`);
   });
 
   // --- Pass hand ---
-  socket.on("pass-hand", (room, name) => {
+  // Now uses persistent userId
+  socket.on("pass-hand", (room, userId) => {
     const state = gameState[room];
     if (!state) return socket.emit("receive-message", "Game not started.");
     if (state.phase !== 'PLAYING') return socket.emit("receive-message", "Waiting for Landlord to be determined.");
-    if (socket.id !== state.activePlayer) return socket.emit("receive-message", "Not your turn.");
+    if (userId !== state.activePlayer) return socket.emit("receive-message", "Not your turn.");
     if (!state.lastHand) return socket.emit("receive-message", "Cannot pass the first hand of the round.");
     
     // 1. Increment pass count
@@ -293,14 +356,47 @@ io.on("connection", socket => {
       state.passCount = 0; // Reset count
     }
 
-    const msg = `${name} passed.`;
+    const msg = `${userId} passed.`;
     socket.emit("receive-message", msg);
     socket.to(room).emit("receive-message", msg);
 
     // 3. Next turn
     state.turnIndex = (state.turnIndex + 1) % state.turnOrder.length;
-    state.activePlayer = state.turnOrder[state.turnIndex];
+    state.activePlayer = state.turnOrder[state.turnIndex]; // activePlayer is userId
     io.in(room).emit("turn-update", state.activePlayer);
     io.in(room).emit("receive-message", `It's ${state.activePlayer}'s turn.`);
   });
+});
+
+// --- RENDER WAKE-UP PING LOGIC ---
+
+function startPinging() {
+    const url = 'https://doudizhu-eo39.onrender.com';
+    const interval = 10 * 60 * 1000; // 10 minutes
+
+    console.log(`Starting scheduled pings to ${url} every ${interval / 1000 / 60} minutes.`);
+
+    setInterval(() => {
+        https.get(url, (res) => {
+            // Consume the response data to free up memory
+            res.on('data', (chunk) => { /* do nothing */ }); 
+            res.on('end', () => {
+                if (res.statusCode === 200) {
+                    console.log(`[Ping Success] ${url} (Status: ${res.statusCode})`);
+                } else {
+                    console.warn(`[Ping Warning] ${url} (Status: ${res.statusCode})`);
+                }
+            });
+        }).on('error', (err) => {
+            console.error(`[Ping Failed] ${url}: ${err.message}`);
+        });
+    }, interval);
+}
+
+// Start the pinging process when the server script runs
+startPinging();
+
+// Start the HTTP server on the designated port
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
